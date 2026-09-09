@@ -51,7 +51,7 @@ Pinterest представляет собой визуальную поиско�
 **Список источников**
 
 1) [Годовой отчёт Pinterest за 2025 год](https://venuelabs.com/ru/pinterest-statistics/)
-2) [Показатели роста в 2026 году]((https://digital-digest.ru/ayditoriia-pinterest-vyrosla-do-640-mln-polzovatelei-itogi-vtorogo-kvartala-2026-goda/?ysclid=mtuc377c4s984092196))
+2) [Показатели роста в 2026 году](https://digital-digest.ru/ayditoriia-pinterest-vyrosla-do-640-mln-polzovatelei-itogi-vtorogo-kvartala-2026-goda/?ysclid=mtuc377c4s984092196)
 3) [Архитектура Pinterest](https://rudesignshop.ru/blog/arhitektura-pinterest/?utm_referrer=https%3A%2F%2Fyandex.ru%2F)
 4) [Pinterest в 2026 году](https://mybusiness.by/2026/tpost/pinterest-v-2026-prodazhi)
 
