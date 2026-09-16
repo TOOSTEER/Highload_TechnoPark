@@ -50,7 +50,7 @@ Pinterest представляет собой визуальную поиско�
 
 ## 2. Расчет нагрузки
 
-**Продуктовые метрики [[3]](https://rudesignshop.ru/blog/arhitektura-pinterest/?utm_referrer=https%3A%2F%2Fyandex.ru%2F), [[4]](https://mybusiness.by/2026/tpost/pinterest-v-2026-prodazhi)**
+**Продуктовые метрики [[3]](https://rudesignshop.ru/blog/arhitektura-pinterest/?utm_referrer=https%3A%2F%2Fyandex.ru%2F), [[4]](https://mybusiness.by/2026/tpost/pinterest-v-2026-prodazhi), [[5]]((https://investor.pinterest.com/financials/quartely-results/default.aspx)), [[6]](https://resourcera.com/data/social/pinterest-users/)**
 
 **Исходные данные:**
 
@@ -88,11 +88,36 @@ Pinterest представляет собой визуальную поиско�
 
 **Технические метрики**
 
+**Размер хранения в разбивке по типам данных:**
+
+- Изображения:
+    1) Количество пинов - 300 млрд.
+    2) Средний размер изображения - 500 Кб
+    3) Общий объем - 150 Тб
+
+- Видео:
+    1) Доля от общего числа пинов - 10%
+    2) Средний размер видео - 25 Мб
+    3) Общий объем - 300 Тб
+
+- Метаданные:
+    1) Каждый пин содержит - ID, описание, ссылку, ID пользователя, ID доски, теги, категории
+    2) Средний размер записи - 5 Кб
+    3) Общий объем - 900 Тб
+
+**Сетевой трафик:**
+
+- Суммарный суточный трафик:
+Исходя из 89,6 млн DAU, 250 просмотров пинов на одного пользователя и в среднем 250 Кб для превью можно 
+
 ## Список источников
 
 1) [Годовой отчёт Pinterest за 2025 год](https://venuelabs.com/ru/pinterest-statistics/)
 2) [Показатели роста в 2026 году](https://digital-digest.ru/ayditoriia-pinterest-vyrosla-do-640-mln-polzovatelei-itogi-vtorogo-kvartala-2026-goda/?ysclid=mtuc377c4s984092196)
 3) [Архитектура Pinterest](https://rudesignshop.ru/blog/arhitektura-pinterest/?utm_referrer=https%3A%2F%2Fyandex.ru%2F)
 4) [Pinterest в 2026 году](https://mybusiness.by/2026/tpost/pinterest-v-2026-prodazhi)
+5) [Финансовые отчеты](https://investor.pinterest.com/financials/quartely-results/default.aspx)
+6) [Данные пользовательской активности](https://resourcera.com/data/social/pinterest-users/)
+7) [Сетевые данные](https://vk.ru/away.php?to=https%3A%2F%2Fwww.cisco.com%2Fc%2Fen%2Fus%2Ftd%2Fdocs%2Fios-xml%2Fios%2Fqos_nbar%2Fprot_lib%2Fconfig_library%2Fpp4400%2Fnbar-prot-pack4400%2Fp.html%3Flinkclickid%3Daisrch&utf=1)
 
 
