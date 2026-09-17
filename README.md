@@ -50,7 +50,7 @@ Pinterest представляет собой визуальную поиско�
 
 ## 2. Расчет нагрузки
 
-**Продуктовые метрики [[3]](https://rudesignshop.ru/blog/arhitektura-pinterest/?utm_referrer=https%3A%2F%2Fyandex.ru%2F), [[4]](https://mybusiness.by/2026/tpost/pinterest-v-2026-prodazhi), [[5]]((https://investor.pinterest.com/financials/quartely-results/default.aspx)), [[6]](https://resourcera.com/data/social/pinterest-users/)**
+**Продуктовые метрики [[3]](https://rudesignshop.ru/blog/arhitektura-pinterest/?utm_referrer=https%3A%2F%2Fyandex.ru%2F), [[4]](https://mybusiness.by/2026/tpost/pinterest-v-2026-prodazhi), [[5]](https://investor.pinterest.com/financials/quartely-results/default.aspx), [[6]](https://resourcera.com/data/social/pinterest-users/)**
 
 **Исходные данные:**
 
