@@ -255,7 +255,7 @@ flowchart TB
 
 [[7]](https://medium.com/pinterest-engineering) Pinterest Engineering Blog — официальный слоган технического блога компании: «Inventive engineers building the first visual discovery engine, 300 billion ideas and counting». 
 
-[[8]](https://www.sec.gov/Archives/edgar/data/1506293/000150629325000195/q2-25xpressrelease.htm) Pinterest, Inc. Q2 2025 Earnings press release, 07.08.2026: заявление о том, что поколение Gen Z составляет более половины аудитории
+[[8]](https://www.sec.gov/Archives/edgar/data/1506293/000150629325000195/q2-25xpressrelease.htm) Pinterest, Inc. Q2 2025 Earnings press release, 07.08.2026: заявление о том, какое поколение составляет более половины аудитории
 
 [[9]](https://www.blog.udonis.co/mobile-marketing/mobile-apps/pinterest) Udonis Blog. *Pinterest Statistics [2026]: Users, Downloads & Revenue* (сторонняя оценка на основе данных мобильной аналитики AppMagic: мобильный DAU/MAU ≈ 28%; отмечено, что это оценка только по мобильному приложению, без веб-трафика)
 
