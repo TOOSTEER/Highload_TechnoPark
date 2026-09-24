@@ -190,10 +190,10 @@ Pinterest представляет собой визуальную поиско�
 
 ```mermaid
 flowchart LR
-    U[Пользователь] -->|DNS-запрос| R53[Route 53<br/>Latency/Geo routing + health checks]
-    R53 -->|минимальная задержка,<br/>ДЦ здоров| NA[Регион: America<br/>us-east-1 / us-west-2]
-    R53 -->|минимальная задержка,<br/>ДЦ здоров| EU[Регион: Europe<br/>eu-west-1 / eu-central-1]
-    R53 -->|минимальная задержка,<br/>ДЦ здоров| AP[Регион: APAC/ROW<br/>ap-southeast-1 / доп. регион]
+    U[Пользователь] -->|DNS-запрос| R53[<br/>Geo routing + health checks]
+    R53 -->|минимальная задержка,<br/>ДЦ здоров| NA[Регион: America]
+    R53 -->|минимальная задержка,<br/>ДЦ здоров| EU[Регион: Europe]
+    R53 -->|минимальная задержка,<br/>ДЦ здоров| AP[Регион: APAC/ROW]
     R53 -.failover, если недоступен.-> NA
     R53 -.failover, если недоступен.-> EU
 ```
