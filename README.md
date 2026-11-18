@@ -113,16 +113,16 @@ Pinterest представляет собой визуальную поиско�
 
 ### 3.1 Домены
 
-| Домен | Профиль |
-|---|---|
-| Identity/Auth | регистрация, сессии; низкий RPS |
-| Pin Service | CRUD пинов; средний RPS |
-| Board Service | CRUD досок; очень низкий RPS |
-| Media/Storage | хранение, транскодирование; огромный объём |
-| Search & Visual Search (включая сервис вывода эмбеддингов и ANN-брокер) | поиск, ML-инференс; высокий RPS + CPU |
-| Feed/Recommendation (включая Graph-сервис с `PIN_GRAPH`) | лента, Pixie; самый высокий RPS |
-| Interaction/Graph | лайки, сохранения; средний RPS |
-| Ads/Monetization | реклама; вне MVP |
+| Домен | Профиль | Хранилище (п. 6) |
+|---|---|---|
+| Identity/Auth | регистрация, сессии; низкий RPS | MySQL `identity`, `global`; Redis `SESSION` |
+| Pin Service | CRUD пинов; средний RPS | MySQL `pin` |
+| Board Service | CRUD досок; очень низкий RPS | MySQL `board` |
+| Media/Storage | хранение, транскодирование; огромный объём | MySQL `media`, S3 |
+| Search & Visual Search (включая сервис вывода эмбеддингов и ANN-брокер) | поиск, ML-инференс; высокий RPS + CPU | OpenSearch, ANN |
+| Feed/Recommendation (включая Graph-сервис с `PIN_GRAPH`) | лента, Pixie; самый высокий RPS | Redis, Graph-сервис |
+| Interaction/Graph | лайки, сохранения; средний RPS | TiDB, Kafka |
+| Ads/Monetization | реклама; вне MVP | - |
 
 ### 3.2 Расположение ДЦ
 
@@ -212,8 +212,8 @@ flowchart TB
       L7B["NGINX Ingress: ⌈N/2⌉+1 узлов"]
     end
     SVC["Envoy-sidecar + поды сервисов"]
-    PRX["ProxySQL * 2, N*2"]
-    DB[("MySQL: primary + реплики")]
+    PRX["ProxySQL * 2 на кластер БД, N*2"]
+    DB[("MySQL: 5 кластеров, primary + реплики")]
   end
 
   GD --> L4A
@@ -238,7 +238,7 @@ flowchart TB
 **Выбранные решения:**
 - **Медиа** (96% пинов - изображения) почти целиком обслуживает CDN;
 - **Envoy-sidecar** - HTTP/2 держит одно соединение;
-- **СУБД** - MySQL с шардированием [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f);
+- **СУБД** - MySQL: 5 кластеров по доменам, шардирование внутри кластера [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f);
 - **L4** в AWS - управляемый NLB;
 - **Перелив** - для промахов CDN (120 из 134,85 Гбит/с). API остаётся в домашнем регионе.
 
@@ -250,7 +250,7 @@ flowchart TB
 | NGINX | consistent hashing + DSR | health-check, запасной узел в зоне |
 | сервис | random two least_conn [[18]](https://nginx.org/en/docs/http/ngx_http_upstream_module.html) | readiness, graceful drain |
 | Envoy | least request + zone-aware [[33]](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/priority) | outlier detection |
-| ProxySQL | read в реплику, write в primary | failover |
+| ProxySQL (пара на кластер БД) | read в реплику, write в primary | failover |
 | ДЦ → регионы | weighted routing [[34]](https://docs.aws.amazon.com/global-accelerator/latest/dg/about-endpoint-groups-traffic-dial.html), [[35]](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-weighted.html) | порог 80 %, возврат 70 % |
 
 #### 4.1.3. Формулы резервирования
@@ -535,18 +535,20 @@ erDiagram
 
 ### 5.3 Потоки данных
 
-Создание пина:
+Создание пина (три кластера MySQL, общей транзакции нет - сага, п. 9.2):
 ```text
-клиент --(файл)--> UPLOAD_STAGING → MEDIA (ready) + MEDIA_FILE
-                       ▼
-           PIN (+ position)            одна атомарная операция
-                       ▼
-           PIN_TEXT_INDEX, PIN_VECTOR, BOARD.pin_count   асинхронно
+клиент --(файл)--> UPLOAD_STAGING
+Media Service --> [media]  MEDIA (ready) + MEDIA_FILE
+Pin Service   --> [pin]    PIN (board_id, board_seq) + PIN_STATS                   транзакция 1
+Pin Service   --> [board]  BOARD_PIN (board_id, sequence = created_at, pin_id)     транзакция 2
+                           не прошла - применит потребитель cdc.mysql.pin; ключ тот же, повтор безопасен
+                  асинхронно: PIN_TEXT_INDEX, PIN_VECTOR, BOARD.pin_count
 ```
 
 Сохранение:
 ```text
-PIN оригинала --> новый PIN: parent_pin_id = оригинал, board_id = доска сохраняющего
+PIN оригинала --> [pin]   новый PIN: parent_pin_id = оригинал, board_id = доска сохраняющего
+              --> [board] BOARD_PIN доски сохраняющего (как при создании)
               --> save --> PIN_STATS, USER_INTEREST, USER_RECENT
 ```
 
@@ -569,7 +571,7 @@ FEED_CACHE → OBJECT_CACHE, USER_CACHE, BOARD_CACHE
 
 Вход:
 ```text
-email → USER_LOOKUP → user_id → USER → AUTH_IDENTITY → SESSION
+email → USER_LOOKUP [global] → user_id → USER, AUTH_IDENTITY [identity] → SESSION
 каждый API → SESSION
 ```
 
@@ -665,8 +667,8 @@ email → USER_LOOKUP → user_id → USER → AUTH_IDENTITY → SESSION
 | --- | --- | --- |
 | USER | строгая | user_id; вход - хеш |
 | AUTH_IDENTITY | строгая | user_id |
-| BOARD | read-your-writes | owner_id |
-| PIN | read-your-writes | шард доски; сохранение → шард сохраняющего |
+| BOARD | read-your-writes | owner_id; кластер `board` |
+| PIN | read-your-writes автору | pin_id; кластер `pin`; сохранение → шард сохраняющего |
 | MEDIA | неизменяем | media_id |
 | PIN_LIKE | идемпотентна | user_id |
 | USER_INTEREST | eventual | user_id |
@@ -681,36 +683,40 @@ email → USER_LOOKUP → user_id → USER → AUTH_IDENTITY → SESSION
 | EVENT_STREAM | at-least-once | user_id |
 | PIN_GRAPH | eventual | копия на 18 узлах |
 
+**Между кластерами MySQL** (`identity`, `pin`, `board`, `media`): внутри кластера - транзакции; между кластерами - сага с идемпотентными шагами, согласованность eventual, автору пина `BOARD_PIN` виден сразу (шаг выполняется в том же запросе). Внешних ключей и JOIN между кластерами нет.
+
 ---
 
 ## 6. Физическая схема БД
 
-Шесть классов хранения:
-- OLTP-ядро - шардированный MySQL;
+Бизнес-логика разнесена по доменам (п. 3.1): у каждого домена свой кластер MySQL, сервис ходит только в свой кластер. JOIN и внешние ключи между кластерами невозможны; согласованность между кластерами обеспечивают саги (п. 5.3, 9.2). Классы хранения:
+- **5 кластеров MySQL** по доменам: `identity`, `pin`, `board`, `media`, `global` - в каждом шардирование считается отдельно;
 - TiDB - тяжёлые узкие таблицы;
-- Redis + Memcached - кеши (Redis - отдельные деплойменты по типу ключей);
+- Redis + Memcached - кеши (Redis - отдельные деплойменты по типу ключей, в каждом регионе свой);
 - Kafka - поток событий;
 - S3 - файлы;
 - OpenSearch / ANN - поиск.
 
 ### 6.1 Физическая схема
 
+Сплошная линия - связь внутри кластера, пунктир - логическая ссылка между кластерами (без внешнего ключа).
+
 ```mermaid
 erDiagram
     USER ||--o{ AUTH_IDENTITY : "входит"
     USER ||--o| USER_LOOKUP : "ищется"
-    USER ||--o{ BOARD : "владеет"
+    USER ||..o{ BOARD : "владеет"
     BOARD ||--o{ BOARD_PIN : "содержит"
-    BOARD_PIN ||--|| PIN : "указывает"
-    MEDIA ||--o{ PIN : "файл"
+    BOARD_PIN ||..|| PIN : "указывает"
+    MEDIA ||..o{ PIN : "файл"
     PIN ||--|| PIN_STATS : "счётчики"
-    USER ||--o{ PIN_LIKE : "ставит"
-    PIN ||--o{ PIN_LIKE : "получает"
-    USER ||--o{ USER_INTEREST : "интерес"
+    USER ||..o{ PIN_LIKE : "ставит"
+    PIN ||..o{ PIN_LIKE : "получает"
+    USER ||..o{ USER_INTEREST : "интерес"
     CATEGORY ||--o{ USER_INTEREST : "тема"
 
     USER {
-        bigint user_id PK "MySQL, ID-шард"
+        bigint user_id PK "MySQL identity, 4 шарда"
         varchar username "через USER_LOOKUP"
         varchar email "через USER_LOOKUP"
         varchar display_name
@@ -723,20 +729,26 @@ erDiagram
         varchar about
     }
     AUTH_IDENTITY {
-        bigint user_id PK "MySQL, шард user"
+        bigint user_id PK "MySQL identity, шард user"
         tinyint provider PK
         varchar provider_uid
         varbinary password_hash
         timestamp created_at
     }
     USER_LOOKUP {
-        tinyint lookup_type PK "MySQL, 1 primary"
+        tinyint lookup_type PK "MySQL global, 1 шард"
         binary key_hash PK "16 Б"
         bigint user_id
     }
+    CATEGORY {
+        smallint category_id PK "MySQL global, 1 шард"
+        smallint parent_id
+        varchar name
+        varchar slug
+    }
     BOARD {
-        bigint board_id PK "MySQL, ID-шард"
-        bigint owner_id FK "IDX owner_id, created_at"
+        bigint board_id PK "MySQL board, 256 шардов"
+        bigint owner_id "IDX owner_id, created_at"
         varchar name
         varchar description
         smallint category_id
@@ -747,13 +759,14 @@ erDiagram
         timestamp updated_at
     }
     BOARD_PIN {
-        bigint board_id PK "MySQL, шард доски"
+        bigint board_id PK "MySQL board, шард доски"
         int sequence PK "DESC"
         bigint pin_id PK
     }
     PIN {
-        bigint pin_id PK "MySQL, ID-шард доски"
+        bigint pin_id PK "MySQL pin, 4 096 шардов"
         bigint board_id
+        int board_seq
         bigint author_id
         bigint media_id
         bigint parent_pin_id
@@ -768,8 +781,14 @@ erDiagram
         smallint media_w
         smallint media_h
     }
+    PIN_STATS {
+        bigint pin_id PK "MySQL pin, шард пина"
+        int like_count
+        int save_count
+        int click_count
+    }
     MEDIA {
-        bigint media_id PK "MySQL, ID-шард загрузившего"
+        bigint media_id PK "MySQL media, 1 024 шарда"
         tinyint type
         smallint width
         smallint height
@@ -782,12 +801,6 @@ erDiagram
         int dominant_color
         timestamp created_at
     }
-    PIN_STATS {
-        bigint pin_id PK "MySQL, шард пина"
-        int like_count
-        int save_count
-        int click_count
-    }
     PIN_LIKE {
         bigint user_id PK "TiDB"
         bigint pin_id PK
@@ -799,31 +812,26 @@ erDiagram
         float score
         timestamp updated_at
     }
-    CATEGORY {
-        smallint category_id PK "MySQL, без шардинга"
-        smallint parent_id
-        varchar name
-        varchar slug
-    }
 ```
 
 Карта хранилищ:
 
 ```mermaid
 flowchart LR
-  SVC["Сервисы"]
-  PRX["ProxySQL * 2"]
+  SVC["Сервисы доменов"]
 
-  subgraph MYSQL["MySQL: 4 096 логических шардов на 64 primary"]
-    M1["ID-шард: USER, AUTH_IDENTITY, BOARD,<br/>BOARD_PIN, PIN, MEDIA, PIN_STATS"]
-    M2["USER_LOOKUP: 1 primary"]
-    M3["CATEGORY: 1 primary"]
+  subgraph MYSQL["MySQL: 5 кластеров, у каждого свой ProxySQL * 2 в регионе"]
+    MI["identity: USER, AUTH_IDENTITY<br/>4 шарда, 3 primary"]
+    MP["pin: PIN, PIN_STATS<br/>4 096 шардов, 53 primary"]
+    MB["board: BOARD, BOARD_PIN<br/>256 шардов, 5 primary"]
+    MM["media: MEDIA<br/>1 024 шарда, 18 primary"]
+    MG["global: USER_LOOKUP, CATEGORY<br/>1 шард, 1 primary"]
   end
   subgraph TIDB["TiDB"]
     T1["PIN_LIKE, USER_INTEREST"]
   end
-  subgraph REDIS["Redis: 5 деплойментов,<br/>9 мастеров на регион"]
-    R1["SESSION 4, USER_RECENT 2,<br/>FEED_CACHE 1, BOARD_PINS_CACHE 1, дельты 1"]
+  subgraph REDIS["Redis: 5 деплойментов в каждом регионе,<br/>17 мастеров на 3 региона"]
+    R1["SESSION 4, USER_RECENT 4,<br/>FEED_CACHE 3, BOARD_PINS_CACHE 3, дельты 3"]
   end
   subgraph MEMC["Memcached 25 узлов на регион"]
     MC1["OBJECT_CACHE 1 026 ГБ"]
@@ -835,10 +843,11 @@ flowchart LR
   S3["S3"]
   SRCH["OpenSearch + ANN"]
 
-  SVC --> PRX
-  PRX --> M1
-  PRX --> M2
-  PRX --> M3
+  SVC --> MI
+  SVC --> MP
+  SVC --> MB
+  SVC --> MM
+  SVC --> MG
   SVC --> T1
   SVC --> R1
   SVC --> MC1
@@ -848,10 +857,14 @@ flowchart LR
   GRAPH --> R1
   SVC -->|"события"| KAFKA
   SVC -->|"presigned"| S3
-  M1 -->|"Debezium"| KAFKA
+  MP -->|"Debezium: cdc.mysql.pin"| KAFKA
+  MB -->|"Debezium: cdc.mysql.board"| KAFKA
+  MI -->|"Debezium: cdc.mysql.identity"| KAFKA
+  MM -->|"Debezium: cdc.mysql.media"| KAFKA
   T1 -->|"TiCDC"| KAFKA
   KAFKA -->|"дельты"| R1
-  KAFKA -->|"пакет"| M1
+  KAFKA -->|"пакет"| MP
+  KAFKA -->|"BOARD_PIN, pin_count"| MB
   KAFKA --> GRAPH
   KAFKA --> T1
   KAFKA --> SRCH
@@ -859,66 +872,79 @@ flowchart LR
   KAFKA -->|"инвалидация"| MC2
   KAFKA -->|"инвалидация"| MC3
   KAFKA -->|"sink"| S3
-  M1 -->|"XtraBackup"| S3
+  MP -->|"XtraBackup"| S3
+  MB -->|"XtraBackup"| S3
+  MI -->|"XtraBackup"| S3
+  MM -->|"XtraBackup"| S3
+  MG -->|"XtraBackup"| S3
   T1 -->|"BR"| S3
   GRAPH -->|"снимок"| S3
 ```
 
 ### 6.2 Таблица описания
 
-| Таблица | СУБД | Шардирование | Резервирование |
+| Таблица | СУБД / кластер | Шардирование | Резервирование |
 | --- | --- | --- | --- |
-| `USER` | MySQL | ID-шард: 4 096 [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) | primary + sync + async [[31]](https://dev.mysql.com/doc/refman/8.0/en/replication-semisync.html) |
-| `AUTH_IDENTITY` | MySQL | ID-шард | как выше |
-| `BOARD` | MySQL | ID-шард владельца | как выше |
-| `BOARD_PIN` | MySQL | ID-шард доски | как выше |
-| `PIN` | MySQL | ID-шард доски | как выше |
-| `MEDIA` | MySQL | ID-шард загрузившего | как выше |
-| `PIN_STATS` | MySQL | ID-шард пина | как выше |
-| `USER_LOOKUP` | MySQL | **без шардинга, 1 primary** | primary + 3 реплики |
-| `CATEGORY` | MySQL | **1 primary** | primary + реплика |
+| `USER` | MySQL `identity` | ID-шард: 4 [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) | primary + sync + async [[31]](https://dev.mysql.com/doc/refman/8.0/en/replication-semisync.html) |
+| `AUTH_IDENTITY` | MySQL `identity` | ID-шард пользователя | как выше |
+| `USER_LOOKUP` | MySQL `global` | **без шардинга, 1 primary** | primary + 3 реплики |
+| `CATEGORY` | MySQL `global` | **1 шард** | как `USER_LOOKUP` |
+| `BOARD` | MySQL `board` | ID-шард: 256, по владельцу | primary + sync + async |
+| `BOARD_PIN` | MySQL `board` | ID-шард доски | как выше |
+| `PIN` | MySQL `pin` | ID-шард: 4 096, случайный шард региона автора | как выше |
+| `PIN_STATS` | MySQL `pin` | ID-шард пина | как выше |
+| `MEDIA` | MySQL `media` | ID-шард: 1 024, случайный шард региона загрузившего | как выше |
 | `PIN_LIKE` | TiDB | автоматическое | 3 реплики Raft |
 | `USER_INTEREST` | TiDB | автоматическое | как `PIN_LIKE` |
-| **`SESSION`** | **Redis, отдельный деплоймент** | **4 мастера + 4 реплики** (пик 252 160 / 80 000 = 3,15) | реплика |
-| **`FEED_CACHE`** | **Redis** | **1 мастер + 1 реплика** (пик 61 050 / 80 000) | реплика |
-| **`USER_RECENT`** | **Redis** | **2 мастера + 2 реплики** (пик 96 450 / 80 000) | реплика |
-| **`BOARD_PINS_CACHE`** | **Redis** | **1 мастер + 1 реплика** (пик 24 600) | реплика |
-| **Дельты `PIN_STATS`** | **Redis** | **1 мастер + 1 реплика** (пик 9 300) | реплика |
+| **`SESSION`** | **Redis, отдельный деплоймент** | **1 мастер на регион, в ROW 2** | реплика |
+| **`FEED_CACHE`** | **Redis** | **1 мастер на регион** | реплика |
+| **`USER_RECENT`** | **Redis** | **1 мастер на регион, в ROW 2** | реплика |
+| **`BOARD_PINS_CACHE`** | **Redis** | **1 мастер на регион** | реплика |
+| **Дельты `PIN_STATS`** | **Redis** | **1 мастер на регион** | реплика |
 | **`OBJECT_CACHE`** | Memcached [[29]](https://github.com/facebook/mcrouter) | consistent hashing | без реплик |
 | **`USER_CACHE`** | Memcached | consistent hashing | без реплик |
 | **`BOARD_CACHE`** | Memcached | consistent hashing | без реплик |
 | **`PIN_GRAPH`** | Graph-сервис | полная копия на 18 узлах | резерв 2×(⌈N/2⌉+1), снимок в S3 |
 | `EVENT_STREAM` | Kafka [[24]](https://kafka.apache.org/documentation/) | партиции по ключу | RF 3 |
 | `MEDIA_FILE`, `UPLOAD_STAGING` | S3 [[32]](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html) | хеш-префикс | три зоны + реплика |
-| `PIN_TEXT_INDEX` | OpenSearch | 600 шардов по 50 ГБ | 1 реплика |
+| `PIN_TEXT_INDEX` | OpenSearch | 600 шардов по 50 ГБ, полная копия в каждом регионе | при отказе узла - перелив в соседний регион |
 | `PIN_VECTOR` | ANN [[30]](https://github.com/facebookresearch/faiss) | 30 шардов по 240 ГБ | 2 реплики |
 
 #### Правило шардирования
 
+Шард - отдельная схема MySQL (`pin_0000` … `pin_4095`) на хосте; ProxySQL направляет запрос по имени схемы. Число шардов считается для каждого кластера отдельно: берётся ровно столько, сколько нужно по объёму, а не одно число на всю систему.
+
 ```text
+D_сейчас   = сумма сырых объёмов таблиц кластера * 1,3     (индексы, фрагментация InnoDB, undo; 135,6 ТБ * 1,3 ≈ 176 ТБ по всем кластерам)
 D_горизонт = D_сейчас * 1,2 * G
-N = min степень двойки, при которой D_горизонт / N <= 100 ГБ
+N_шардов   = min степень двойки, при которой D_горизонт / N <= 100 ГБ
+N_хостов   = ⌈D_горизонт / 4,5 ТБ⌉, считается по регионам (NVMe 7,5 ТБ, заполнение <= 60 %)
 ```
 
-`G` для ядра - 1,55 (82,4 млрд новых пинов/год * 2), для USER_LOOKUP - 1,23.
+`G` - рост за 2 года: для `pin`, `media`, `board` 1,55 (82,4 млрд новых пинов в год * 2); для `identity`, `global` 1,23 (рост MAU 11 % в год).
 
-| База | Данные | G | Через 2 года | Шардов |
-| --- | ---: | ---: | ---: | ---: |
-| Ядро | 177 ТБ | 1,55 | 275 ТБ | **4 096** |
-| USER_LOOKUP | 51 ГБ | 1,23 | 63 ГБ | **1** |
-| CATEGORY | 0,5 МБ | 1 | 0,5 МБ | **1** |
+| Кластер | Таблицы | Сырой объём | D_сейчас | G | D_горизонт | Шардов | ГБ/шард | Primary-хостов (NA / EU / ROW) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `pin` | PIN, PIN_STATS | 96,6 ТБ | 125,6 ТБ | 1,55 | 233,6 ТБ | **4 096** | 57 | **53** (9 / 13 / 31) |
+| `media` | MEDIA | 32,1 ТБ | 41,7 ТБ | 1,55 | 77,6 ТБ | **1 024** | 76 | **18** (3 / 5 / 10) |
+| `board` | BOARD, BOARD_PIN | 6,7 ТБ | 8,7 ТБ | 1,55 | 16,2 ТБ | **256** | 63 | **5** (1 / 1 / 3) |
+| `identity` | USER, AUTH_IDENTITY | 151 ГБ | 196 ГБ | 1,23 | 290 ГБ | **4** | 72 | **3** (1 / 1 / 1) |
+| `global` | USER_LOOKUP, CATEGORY | 42,5 ГБ | 55 ГБ | 1,23 | 82 ГБ | **1** | 82 | **1** |
 
-**Redis:** `max(⌈объём / 64 ГБ⌉, ⌈нагрузка_пик / 80 000⌉, 1)`. Минимум 1 мастер + 1 реплика.
+Шарды делятся по регионам в тех же долях, что и нагрузка (17 / 25 / 58 %): `pin` 704 / 1 024 / 2 368, `media` 176 / 256 / 592, `board` 44 / 64 / 148, `identity` 1 / 1 / 2. Данные на хосте на горизонте: `pin` 4,5 ТБ, `media` 4,5 ТБ, `board` 4,1 ТБ - в пределах 4,5 ТБ. `USER_LOOKUP` и `CATEGORY` без шардинга: на горизонте 82 ГБ, это меньше предела 100 ГБ.
 
-| Деплоймент | Объём | Пиковая нагрузка (чтение+запись) | Шардов |
-| --- | ---: | ---: | ---: |
-| `SESSION` | 74 ГБ | 252 160 оп/с | **4** |
-| `USER_RECENT` | 111 ГБ | 96 450 оп/с | **2** |
-| `FEED_CACHE` | 26 ГБ | 61 050 оп/с | **1** |
-| `BOARD_PINS_CACHE` | 60 ГБ | 24 600 оп/с | **1** |
-| Дельты `PIN_STATS` | малый | 9 300 оп/с | **1** |
+**Redis:** узлов = `max(⌈объём региона / 51 ГБ⌉, ⌈нагрузка региона в пике / 80 000⌉, 1)`. 51 ГБ - это 0,8 от узла 64 ГБ (запас на копирование страниц при снимке RDB). Структуры привязаны к пользователям региона, поэтому объём и нагрузка берутся в доле региона (17 / 25,5 / 57,5 %). Минимум - 1 мастер + 1 реплика.
 
-Мастеров на регион: 4+1+2+1+1 = **9**; с репликами 18 на регион, 54 по трём регионам.
+| Деплоймент | Объём (глобально) | Пик, оп/с (глобально) | NA | EU | ROW |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `SESSION` | 74 ГБ | 252 160 | 1 | 1 | **2** (145 000 оп/с > 80 000) |
+| `USER_RECENT` | 111 ГБ | 96 450 | 1 | 1 | **2** (63,8 ГБ > 51 ГБ) |
+| `FEED_CACHE` | 26 ГБ | 61 050 | 1 | 1 | 1 |
+| `BOARD_PINS_CACHE` | 60 ГБ | 24 600 | 1 | 1 | 1 |
+| Дельты `PIN_STATS` | малый | 9 300 | 1 | 1 | 1 |
+| **Мастеров** | | | **5** | **5** | **7** |
+
+Мастеров 17, с репликами **34**. Один шард хватает во всех деплойментах, кроме `SESSION` и `USER_RECENT` в ROW.
 
 **Остальные хранилища:**
 
@@ -929,23 +955,26 @@ N = min степень двойки, при которой D_горизонт / 
 | OpenSearch | 600 | 30 ТБ / 50 ГБ |
 | ANN | 30 | 7,2 ТБ / 240 ГБ |
 
-**Размер MySQL:** 177 ТБ / 4 096 = 43 ГБ/шард, / 64 хоста = 2,8 ТБ/хост, × 3 копии = **192 хоста**.
+**Размер MySQL:** хосты на горизонте заполнены до 4,5 ТБ из 7,5 ТБ; число копий - 3 (primary + sync + async).
 
-**Размер TiDB:** 105,4 ТБ × 3 = 316 ТБ / 80 = 3,95 ТБ/узел.
+**Размер TiDB:** 105,4 ТБ * 3 = 316 ТБ / 80 = 3,95 ТБ/узел.
 
 **Число узлов:**
 
-| Кластер | Всего |
-| --- | ---: |
-| MySQL основной | 192 |
-| MySQL USER_LOOKUP | 4 |
-| MySQL CATEGORY | 2 |
-| TiDB | 89 |
-| Memcached | 75 |
-| Kafka | 27 |
-| **Redis (5 деплойментов)** | **54** (9 мастеров + 9 реплик × 3 региона) |
-| Graph-сервис | 18 |
-| ANN | 180 |
+| Кластер | Primary | Всего (с копиями) |
+| --- | ---: | ---: |
+| MySQL `pin` | 53 | 159 |
+| MySQL `media` | 18 | 54 |
+| MySQL `board` | 5 | 15 |
+| MySQL `identity` | 3 | 9 |
+| MySQL `global` | 1 | 4 |
+| TiDB | - | 89 |
+| Memcached | - | 75 |
+| Kafka | - | 27 |
+| **Redis (5 деплойментов)** | 17 | **34** |
+| OpenSearch | - | 52 (10 / 13 / 29) |
+| Graph-сервис | - | 18 |
+| ANN | - | 180 |
 
 ### 6.3 Идентификаторы
 
@@ -954,20 +983,30 @@ N = min степень двойки, при которой D_горизонт / 
 ```text
 id       = (shard_id << 46) | (type << 36) | local_id
 shard_id = (id >> 46) & 0xFFFF
+type     -> кластер -> карта «шард -> хост» в ZooKeeper
 ```
 
-| Объект | Шард |
-| --- | --- |
-| пользователь | случайный из своего региона |
-| доска | шард владельца |
-| пин | шард доски |
-| медиа | шард загрузившего |
+`type` определяет кластер, `shard_id` - шард внутри него; `local_id` 36 бит (68,7 млрд) с запасом покрывает 73 млн пинов на шард.
 
-**Регионы:** US&Canada 704 / 11 хостов, Европа 1 024 / 16, ROW 2 368 / 37, всего **4 096 / 64**.
+| Объект | Кластер | Выбор шарда при создании |
+| --- | --- | --- |
+| пользователь | `identity` | случайный из своего региона |
+| доска | `board` | `hash(owner_id)` внутри региона владельца: список досок и страницы доски - в одном шарде |
+| пин | `pin` | случайный из региона автора; список пинов доски лежит в `BOARD_PIN` |
+| медиа | `media` | случайный из региона загрузившего |
+
+**Регионы (шардов / primary-хостов):**
+
+| Кластер | US&Canada | Европа | ROW | Всего |
+| --- | --- | --- | --- | --- |
+| `pin` | 704 / 9 | 1 024 / 13 | 2 368 / 31 | 4 096 / 53 |
+| `media` | 176 / 3 | 256 / 5 | 592 / 10 | 1 024 / 18 |
+| `board` | 44 / 1 | 64 / 1 | 148 / 3 | 256 / 5 |
+| `identity` | 1 / 1 | 1 / 1 | 2 / 1 | 4 / 3 |
 
 **Маршрут USER_LOOKUP:**
 ```text
-email --> md5(email) mod 1 = 0 --> 1 primary --> user_id --> shard_id --> MySQL
+email --> md5(email) mod 1 = 0 --> кластер global, 1 primary --> user_id --> type, shard_id --> кластер identity
 ```
 
 ### 6.4 Индексы
@@ -985,12 +1024,15 @@ email --> md5(email) mod 1 = 0 --> 1 primary --> user_id --> shard_id --> MySQL
 | `PIN_LIKE` | PK + IDX | «лайкнул ли» + список | +52,6 ТБ |
 | `USER_INTEREST` | PK | все интересы | кластерный |
 
+Вторичного индекса `PIN (board_id)` нет: пины доски находятся через `BOARD_PIN`.
+
 ### 6.5 Денормализация
 
 | Что | Зачем | Цена |
 | --- | --- | --- |
-| `media_key`, размеры в `PIN` | нет чтений MEDIA при показе | +13,2 ТБ |
-| `BOARD_PIN` отдельно | нет перезаписи PIN | 6 ТБ |
+| `media_key`, размеры в `PIN` | нет чтений `MEDIA` и обращений в кластер `media` при показе | +13,2 ТБ |
+| `BOARD_PIN` отдельно | `PIN` и доска в разных кластерах: страница доски читается без обращения в `pin`; `PIN` не перезаписывается | 6 ТБ |
+| `board_id`, `board_seq` в `PIN` | при удалении пина строка `BOARD_PIN` удаляется по ключу без индекса | в 302 Б строки |
 | `PIN_STATS` + пакет | нет блокировок | 6 ТБ |
 | `pin_count` в BOARD | без подсчёта | асинхронно |
 | Лайки в двух порядках | быстро и «лайкнул» и список | +52,6 ТБ |
@@ -1001,13 +1043,15 @@ email --> md5(email) mod 1 = 0 --> 1 primary --> user_id --> shard_id --> MySQL
 
 **Счётчики:** Kafka → потребитель → Redis (`HINCRBY`) → пакетный UPDATE MySQL → offset.
 
+**Ссылочная целостность между кластерами:** внешних ключей нет; её держат саги (п. 9.2) и ночная сверка: выборка `BOARD_PIN` проверяется на существование `PIN`, расхождения исправляет повтор события.
+
 ### 6.6 Клиентские библиотеки
 
 | Компонент | Библиотека |
 | --- | --- |
-| MySQL | Connector/J + HikariCP + своя библиотека шардов |
-| ProxySQL | query rules, hostgroups |
-| ZooKeeper | Curator |
+| MySQL | Connector/J + HikariCP + библиотека шардов (`id` → `type` → кластер → шард → хост) |
+| ProxySQL | query rules по имени схемы, hostgroups, по паре на кластер в регионе |
+| ZooKeeper | Curator, карта «шард → хост» отдельно для каждого кластера |
 | TiDB | MySQL-драйвер |
 | Redis | Lettuce |
 | Memcached | mcrouter |
@@ -1016,34 +1060,33 @@ email --> md5(email) mod 1 = 0 --> 1 primary --> user_id --> shard_id --> MySQL
 | Kafka | Java client |
 | S3 | AWS SDK |
 | Поиск | OpenSearch + gRPC к ANN |
-| CDC | Debezium + TiCDC |
+| CDC | Debezium (4 топика `cdc.mysql.*`) + TiCDC (`cdc.tidb`) |
 
 ### 6.7 Балансировка запросов
 
-| Таблица | Чтение | Запись |
-| --- | ---: | ---: |
-| `PIN` | **55 000** | 7 950 |
-| `BOARD_PIN` | 1 665 | 7 950 |
-| `USER` | **3 382** | 30 |
-| `BOARD` | **1 208** | 42 |
-| `AUTH_IDENTITY` | 6 600 | 15 |
-| `USER_LOOKUP` | 6 600 | 30 |
-| `MEDIA` | 0 | 420 |
-| `PIN_STATS` | 2 775 | 9 300 |
-| **MySQL** | **77 230** | **25 737** |
-| `PIN_LIKE` (TiDB) | 55 500 | 83 000 |
-| `USER_INTEREST` (TiDB) | 9 825 | 18 180 |
-| **TiDB** | **65 325** | **101 180** |
+Нагрузка в пике после кешей, по кластерам:
 
-На хост: 402 записи/с + 1 207 чтений/с. ROW: ≈ **59 200 QPS**.
+| Кластер | Таблицы | Чтение | Запись | Primary | На хост: чтений / записей | QPS в ROW |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `pin` | `PIN` 55 000, `PIN_STATS` 2 775 | **57 775** | 17 250 | 53 | 1 090 / 325 | 43 139 |
+| `identity` | `USER` 3 382, `AUTH_IDENTITY` 6 600 | 9 982 | 45 | 3 | 3 327 / 15 | 5 766 |
+| `board` | `BOARD` 1 208, `BOARD_PIN` 1 665 | 2 873 | 7 992 | 5 | 575 / 1 598 | 6 247 |
+| `media` | `MEDIA` | 0 | 420 | 18 | 0 / 23 | 241 |
+| `global` | `USER_LOOKUP` | 6 600 | 30 | 1 | 6 600 / 30 | 3 812 |
+| **MySQL** | | **77 230** | **25 737** | 80 | | **59 206** |
+| `PIN_LIKE` (TiDB) | | 55 500 | 83 000 | | | |
+| `USER_INTEREST` (TiDB) | | 9 825 | 18 180 | | | |
+| **TiDB** | | **65 325** | **101 180** | | | |
 
-**Закон Литтла:** 1 609 QPS × 0,002 с = 3,2 запроса одновременно. С ProxySQL пул 32 - в **61 раз** меньше соединений.
+Чтения идут в реплики, записи - в primary (ProxySQL, `max_replication_lag` 1 с). Кластер `global` читают три региона с локальных реплик. ROW: ≈ **59 200 QPS** на все пять пар ProxySQL, из них 43 139 - на пару `pin`.
+
+**Закон Литтла:** худший хост - `identity`: 3 342 QPS * 0,002 с = 6,7 запроса одновременно. Без прокси каждый из 356 подов, читающих `pin` (Pin, Feed, Search, Board), держит по 4 соединения на хост: 1 424 соединения. С ProxySQL пул 32 - в **44 раза** меньше.
 
 ### 6.8 Бэкапы
 
 | Хранилище | Метод | RPO | RTO |
 | --- | --- | --- | --- |
-| MySQL | XtraBackup [[28]](https://docs.percona.com/percona-xtrabackup/) + binlog | 5 мин | 1 мин / 1,5-2 ч |
+| MySQL (5 кластеров) | XtraBackup [[28]](https://docs.percona.com/percona-xtrabackup/) с async-реплики + binlog, каждый кластер независимо | 5 мин | 1 мин / 1,5-2 ч |
 | TiDB | BR [[26]](https://docs.pingcap.com/tidb/stable/backup-and-restore-overview) | 5 мин | часы |
 | Graph-сервис | снимок в S3 + пересборка из Kafka/MySQL | до 1 ч | 317 с + 2-4 ч |
 | Redis SESSION | реплика + RDB | потеря = вход | минуты |
@@ -1053,7 +1096,7 @@ email --> md5(email) mod 1 = 0 --> 1 primary --> user_id --> shard_id --> MySQL
 | S3 MEDIA_FILE | версионирование + CRR | минуты | переключение |
 | OpenSearch, ANN | снимок + пересборка | - | часы |
 
-Принцип 3-2-1, Object Lock, проверка восстановления раз в месяц.
+Принцип 3-2-1, Object Lock, проверка восстановления раз в месяц. Восстановление одного кластера не затрагивает остальные: самый крупный хост `pin` содержит 2,4 ТБ, при 400 МБ/с это 1,7 ч.
 
 ---
 
@@ -1295,7 +1338,7 @@ N = ⌈944/611⌉ = 2;  ⌈1 415/611⌉ = 3;  ⌈3 191/611⌉ = 6
 
 **Взаимодействие:**
 - Feed-сервис → Graph-сервис по gRPC;
-- `USER_RECENT` пишет потребитель событий при лайке и сохранении (события из `cdc.tidb` и `cdc.mysql`);
+- `USER_RECENT` пишет потребитель событий при лайке и сохранении (события из `cdc.tidb`, `cdc.mysql.pin` и `cdc.mysql.board`);
 - метаданные страницы читаются из `OBJECT_CACHE`, `USER_CACHE`, `BOARD_CACHE`: 18 500 * 20 = 370 000 чтений/с, как в п. 5.6.
 
 **Сбои:** см. шаги в 7.1.5.
@@ -1500,14 +1543,17 @@ ROW:      10 638 * 0,05725 = 609
 
 #### 7.3.2. Блок применения
 
-Сервисы Pin, Board, Feed, Search, которые читают метаданные объектов. Кеши: `OBJECT_CACHE` (пины), `USER_CACHE` (пользователи), `BOARD_CACHE` (доски) - все в Memcached + mcrouter. 
+Сервисы Pin, Board, Feed, Search, которые читают метаданные объектов. Кеши: `OBJECT_CACHE` (пины), `USER_CACHE` (пользователи), `BOARD_CACHE` (доски) - все в Memcached + mcrouter. Каждый префикс ключей принадлежит своему кластеру MySQL: `pin:` - `mysql-pin`, `user:` - `mysql-identity`, `board:` - `mysql-board` (п. 6.2). 
 
 #### 7.3.3. Постановка задачи
 
-Метаданные пина читаются 1,1 млн раз в секунду в пике. Без кеша на каждый из 64 хостов MySQL пришлось бы:
+Метаданные пина читаются 1,1 млн раз в секунду в пике. Без кеша читали бы напрямую кластеры MySQL своих доменов (п. 6.2), по числу primary-хостов:
 ```text
-1 100 000 / 64 = 17 200 чтений/с на хост
+pin:      1 100 000 / 53 = 20 750 чтений/с на хост
+identity:    67 650 /  3 = 22 550 чтений/с на хост
+board:       24 150 /  5 =  4 830 чтений/с на хост
 ```
+Самый узкий - `identity` (3 хоста): кеш для него так же обязателен, как для `pin`.
 
 **Требования:**
 - обосновать 95 % hit rate;
@@ -1569,7 +1615,7 @@ flowchart TB
      hit - положить в L1 - отдать.
 
 3. При промахе Memcached - взять замок add lock:{ключ} TTL 10 с:
-     успешен - читать MySQL - записать в Memcached - снять замок;
+     успешен - читать MySQL своего кластера (реплика, отставание до 1 с) - записать в Memcached - снять замок;
      не успешен - ждать 20 мс, повторить шаг 2;
      после 5 повторов - читать MySQL самому без кеша.
 
@@ -1582,6 +1628,8 @@ flowchart TB
 
 **Stale set (гонка устаревшей записи):** клиент прочитал старую строку, пин изменили и ключ удалили, клиент записал старое значение в кеш. Повторное удаление из журнала MySQL (Debezium → Kafka → потребитель «инвалидация», 1-2 с) убирает его. Видимость изменения: L1 2 с + повторное удаление 1-2 с, итого меньше 5 с.
 
+**Три кластера:** событие изменения приходит из топика кластера-владельца (`cdc.mysql.pin`, `cdc.mysql.board`, `cdc.mysql.identity`), один потребитель обслуживает все три по префиксу ключа. Заполнение кеша читает реплику с отставанием не более 1 с (`max_replication_lag` ProxySQL [[22]](https://proxysql.com/documentation/)): это меньше задержки двойного удаления 1-2 с, поэтому устаревшее значение, прочитанное с отстающей реплики, всё равно удаляется.
+
 **TTL объекта:** 1 ч с jitter ± 10 %, чтобы ключи не истекали одновременно.
 
 #### 7.3.6. Структуры данных
@@ -1593,7 +1641,7 @@ flowchart TB
 | `board:{board_id}` | строка `BOARD` | 119 Б | 1 ч ± 10 % | Memcached |
 | `lock:{ключ}` | замок | 1 Б | 10 с | Memcached |
 
-**L1-кеш:** LRU в памяти пода, 10 000 ключей * 342 Б = 3,4 МБ, TTL 2 с. Подов 492 (245 562 / 500), в ROW 283 (492 * 57,5 %).
+**L1-кеш:** LRU в памяти пода, 10 000 ключей * 342 Б = 3,4 МБ, TTL 2 с. Подов, читающих метаданные (Feed, Search, Board; п. 11.5): 298, в ROW 170 (57,5 %).
 
 #### 7.3.7. Альтернативные решения
 
@@ -1604,7 +1652,7 @@ flowchart TB
 | Write-through | кеш всегда свежий | 2 650 новых пинов в секунду почти не читаются повторно, вытесняют горячие данные |
 | Write-back | быстрая запись | потеря данных при отказе узла |
 | Только TTL | проще | удалённый пин виден до часа |
-| Репликация горячих ключей на несколько узлов (приём Facebook [[40]](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala)) | снимает нагрузку с узла | с L1 не нужна: 283 / 2 с = 141 чтение в секунду на ключ |
+| Репликация горячих ключей на несколько узлов (приём Facebook [[40]](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala)) | снимает нагрузку с узла | с L1 не нужна: 170 / 2 с = 85 чтений в секунду на ключ |
 | **Выбранный: cache-aside + замок + двойное удаление + L1** | один читатель БД на ключ, изменение видно за 2-5 с | дополнительный кеш L1 в процессе |
 
 #### 7.3.8. Обоснование выбора и параметров
@@ -1618,19 +1666,19 @@ hit = H_s(C) / H_s(N),  H_s(n) = Σ 1/k^s по k от 1 до n
 
 **Пины (C = 3 млрд, N = 300 млрд):**
 
-| Показатель `s` | Hit rate | Чтений `PIN` в MySQL в пике | На хост из 64 |
+| Показатель `s` | Hit rate | Чтений `PIN` в MySQL в пике | На хост из 53 |
 | ---: | ---: | ---: | ---: |
-| 0,9 | 60,4 % | 435 000 | 6 800 |
-| 1,0 | 82,9 % | 188 000 | 2 900 |
-| 1,05 | 90,9 % | 100 000 | 1 560 |
-| **1,1** | **95,8 %** | **46 000** | **720** |
-| 1,2 | 99,3 % | 7 600 | 120 |
+| 0,9 | 60,4 % | 435 000 | 8 208 |
+| 1,0 | 82,9 % | 188 000 | 3 547 |
+| 1,05 | 90,9 % | 100 000 | 1 887 |
+| **1,1** | **95,8 %** | **46 000** | **868** |
+| 1,2 | 99,3 % | 7 600 | 143 |
 
 **Пользователи (C = 160 млн DAU, N = 640 млн MAU) при s = 1,1:** 97,9 %. При s = 1,0: 93,4 %.
 
 **Доски (C = 120 млн = 2 % от 6 млрд, N = 6 млрд) при s = 1,1:** 94,7 %. При s = 1,0: 83,1 %. В расчётах п. 6.7 оставлено 95 %, разница - 72 запроса/с к MySQL (`24 150 * (5,3 % - 5 %)`), на нагрузку не влияет.
 
-**Вывод:** `s = 1,1` - допущение. При `s = 1,0` MySQL выдержит (2 900 чтений на хост), но суммарный поток на ProxySQL региона ROW вырастет до 135 000 QPS, и ProxySQL придётся усилить.
+**Вывод:** `s = 1,1` - допущение. При `s = 1,0` кластер `pin` выдержит (3 547 чтений на хост), но поток на пару ProxySQL `pin` в регионе ROW вырастет с 43 139 до 119 600 QPS (`(188 000 + 2 775 + 17 250) * 0,575`), и ProxySQL придётся усилить.
 
 **Расчёт лавины (stampede):**
 ```text
@@ -1642,7 +1690,7 @@ Facebook с leases снизил пик запросов к БД с 17 тыс. д
 
 **Расчёт hot key:**
 ```text
-283 пода в ROW / 2 с (TTL L1) = 141 запрос/с на ключ до Memcached
+170 подов в ROW / 2 с (TTL L1) = 85 запросов/с на ключ до Memcached
 ```
 
 **Параметры и их обоснование:**
@@ -1665,14 +1713,15 @@ Facebook с leases снизил пик запросов к БД с 17 тыс. д
 - 25 узлов Memcached на регион (75 всего);
 
 **Нагрузка:**
-- MySQL получает `55 000 + 3 382 + 1 208 = 59 590` чтений в пике вместо `1 100 000 + 67 650 + 24 150 = 1 191 800` - в 20 раз меньше;
+- MySQL получает `55 000 + 3 382 + 1 208 = 59 590` чтений в пике вместо `1 100 000 + 67 650 + 24 150 = 1 191 800` - в 20 раз меньше (`pin` 55 000 на 53 хоста, `identity` 3 382 на 3, `board` 1 208 на 5);
 - Memcached `1 191 800 / 75 = 15 900` чтений на узел в пике;
 - замков не больше числа промахов: около 20 030 в секунду в среднем.
 
-**Отказ узла Memcached:** потеря 1 узла из 25 - 4 % ключей, доля промахов растёт с 5 % до `5 % + 4 % * 95 % = 8,8 %`, чтений `PIN` в MySQL `0,088 * 1 100 000 = 96 800` в секунду (вместо 55 000). mcrouter переключает на резервный пул (failover).
+**Отказ узла Memcached:** потеря 1 узла из 25 - 4 % ключей, доля промахов растёт с 5 % до `5 % + 4 % * 95 % = 8,8 %`, чтений `PIN` в MySQL `0,088 * 1 100 000 = 96 800` в секунду (вместо 55 000), то есть 1 826 на хост `pin` вместо 1 038. mcrouter переключает на резервный пул (failover).
 
 **Взаимодействие:**
-- потребитель «инвалидация» из п. 6.1 (Debezium → Kafka → удаление ключа);
+- потребитель «инвалидация» из п. 6.1 (Debezium → Kafka → удаление ключа): топики `cdc.mysql.pin`, `cdc.mysql.board`, `cdc.mysql.identity`;
+- недоступность одного кластера (например, `mysql-board`) не блокирует чтение пинов: у каждого кластера свой ProxySQL, таймаут и circuit breaker (п. 9.3), кешированные метаданные продолжают отдаваться;
 - mcrouter [[29]](https://github.com/facebook/mcrouter);
 - мониторинг доли попаданий: тревога при падении ниже 90 %.
 
@@ -1695,6 +1744,7 @@ Facebook с leases снизил пик запросов к БД с 17 тыс. д
 | Envoy-sidecar [[33]](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/priority) | Межсервисная балансировка (п. 4.1.1) | HTTP/2 держит одно соединение, поэтому балансировать нужно запросы, а не соединения. Envoy умеет least request и zone-aware routing. kube-proxy не подходит - балансирует соединения |
 | **Платформа** | | |
 | Kubernetes (Amazon EKS) [[21]](https://www.verdict.co.uk/?p=401753) | Оркестрация stateless сервисов (п. 4.1.1) | Pinterest переводит сервисы с EC2 на EKS [[21]](https://www.verdict.co.uk/?p=401753). EKS даёт managed control plane; альтернатива - свой Kubernetes - дороже по эксплуатации |
+| Amazon EC2 bare-metal (классы i3en, m6i, r6i) [[45]](https://aws.amazon.com/ec2/instance-types/) | Узлы Kubernetes и все stateful-серверы (п. 11.2) | Нет overhead виртуализации и CPU throttling у сервисов размером от 6 серверов; локальные NVMe для БД. Облачные виртуалки дороже за единицу ресурса. Проектное решение |
 | **Сервисы и вычисления** | | |
 | JVM-сервисы (Java) с библиотеками из п. 6.6 | Pin, Board, Feed, Search, Identity (п. 3.1) | Java - зрелая экосистема: Connector/J, HikariCP, Lettuce, Kafka client (п. 6.6). Проектное решение |
 | gRPC и Protobuf | Межсервисные вызовы (п. 4.1.1) | Бинарный протокол, строгая схема, эффективнее JSON на внутреннем трафике. Внешний API - REST. Проектное решение |
@@ -1702,19 +1752,19 @@ Facebook с leases снизил пик запросов к БД с 17 тыс. д
 | Модель ранжирования ленты (градиентный бустинг, например XGBoost) | Лёгкое ранжирование 1 000 кандидатов до 200 (п. 7.1.5) | Ранжирование занимает 10 мс CPU (допущение); нейросеть на 1 000 кандидатов была бы дороже. Проектное решение |
 | Сервис вывода эмбеддингов на GPU (свёрточная сеть) | Визуальный поиск: картинка → вектор 128 чисел (п. 7.2) | Вектор нужен только при загрузке (620 / 1 850 в секунду, п. 7.2.9); Pinterest использует CNN-признаки для визуального поиска [[38]](https://arxiv.org/abs/1505.07647). Сервер - проектное решение (например, Triton на GPU) |
 | **Хранилища** | | |
-| MySQL 8 (InnoDB) [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) | `USER`, `AUTH_IDENTITY`, `BOARD`, `BOARD_PIN`, `PIN`, `MEDIA`, `PIN_STATS`, `USER_LOOKUP`, `CATEGORY`: 4 096 шардов на 64 primary (п. 6.2) | Ядро данных требует транзакций и уникальных ключей; 77 230 чтений + 25 737 записей в пике после кешей (п. 6.7). PostgreSQL тоже подошёл бы, но Pinterest использует MySQL [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f), и репликация, Orchestrator, ProxySQL вокруг MySQL зрелые |
-| ProxySQL [[22]](https://proxysql.com/documentation/) | Разделение чтения и записи, пул соединений (п. 6.7) | Без прокси 1 968 соединений на хост, с прокси - 32 (в 61 раз меньше). Даёт read/write split и max_replication_lag. Проектное решение |
+| MySQL 8 (InnoDB) [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) | 5 кластеров по доменам: `identity` (`USER`, `AUTH_IDENTITY`; 4 шарда), `pin` (`PIN`, `PIN_STATS`; 4 096), `board` (`BOARD`, `BOARD_PIN`; 256), `media` (`MEDIA`; 1 024), `global` (`USER_LOOKUP`, `CATEGORY`; 1); 80 primary (п. 6.2) | Каждый домен владеет своим кластером: независимые отказы, бэкапы и шардирование, число шардов считается по объёму кластера. Внутри кластера нужны транзакции и уникальные ключи; 77 230 чтений + 25 737 записей в пике после кешей (п. 6.7). PostgreSQL тоже подошёл бы, но Pinterest использует MySQL [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f), и репликация, Orchestrator, ProxySQL вокруг MySQL зрелые |
+| ProxySQL [[22]](https://proxysql.com/documentation/) | Разделение чтения и записи, пул соединений (п. 6.7) | Без прокси 1 424 соединения на хост кластера `pin`, с прокси - 32 (в 44 раза меньше); пара ProxySQL на каждый кластер. Даёт read/write split и max_replication_lag. Проектное решение |
 | ZooKeeper + Apache Curator | Карта «шард → хост» (п. 6.3) | Согласованное хранилище конфигурации; карта меняется при переносе шарда. Альтернатива - etcd. Проектное решение |
 | Orchestrator [[27]](https://github.com/openark/orchestrator) + полусинхронная репликация [[31]](https://dev.mysql.com/doc/refman/8.0/en/replication-semisync.html) | Failover MySQL (п. 6.8) | RPO = 0 при отказе хоста: подтверждённая транзакция уже в журнале реплики. Pinterest в 2015 повышал реплику вручную [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f); здесь выбрано автоматическое - проектное решение |
 | TiDB (TiKV) [[19]](https://medium.com/pinterest-engineering/tidb-adoption-at-pinterest-1130ab787a10) | `PIN_LIKE` (52,6 ТБ), `USER_INTEREST` (0,23 ТБ) (п. 6.2) | 2,63 трлн узких строк, 83 000 вставок/с в пике; автоматическое разбиение по диапазонам, 3 реплики Raft. MySQL с ручным шардированием был бы неудобен. Pinterest мигрирует HBase-нагрузки на TiDB [[19]](https://medium.com/pinterest-engineering/tidb-adoption-at-pinterest-1130ab787a10) |
-| Redis Cluster [[23]](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) | `SESSION` (74 ГБ, 4 шарда), `USER_RECENT` (111 ГБ, 2), `FEED_CACHE` (26 ГБ, 1), `BOARD_PINS_CACHE` (60 ГБ, 1), дельты `PIN_STATS` (1) (п. 6.2) | Нужны структуры данных (списки ленты), TTL и атомарные операции (`HINCRBY`). Memcached этого не умеет. У Pinterest списки в Redis [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) |
+| Redis Cluster [[23]](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) | `SESSION` (74 ГБ), `USER_RECENT` (111 ГБ), `FEED_CACHE` (26 ГБ), `BOARD_PINS_CACHE` (60 ГБ), дельты `PIN_STATS`: в каждом регионе свой деплоймент, 1 мастер, в ROW 2 для `SESSION` и `USER_RECENT`; 17 мастеров всего (п. 6.2) | Нужны структуры данных (списки ленты), TTL и атомарные операции (`HINCRBY`). Memcached этого не умеет. У Pinterest списки в Redis [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) |
 | Memcached + mcrouter [[29]](https://github.com/facebook/mcrouter) | `OBJECT_CACHE` (пины, 342 Б), `USER_CACHE` (144 Б), `BOARD_CACHE` (119 Б): 25 узлов на регион, 75 всего (п. 6.2, 7.3) | Метаданные пина читаются 370 000 раз в секунду, 1,1 млн в пике (п. 5.6); кеш на 1 % пинов даёт 95,8 % попаданий при s = 1,1 (п. 7.3.8) и оставляет на MySQL 55 000 чтений вместо 1 100 000. Redis для этого не нужен: простой cache-aside без структур, Memcached многопоточный и дешевле по памяти. У Pinterest Memcached кеширует объекты [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) |
 | Amazon S3 [[32]](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html) | `MEDIA_FILE` (444 ПБ), `UPLOAD_STAGING` (TTL 24 ч), бэкапы, озеро данных (п. 6.2, 6.8) | 444 ПБ файлов в 1 400 раз больше метаданных (307 ТБ, п. 5.5); в БД не помещаются. S3 - origin для CDN; presigned URL грузит файл мимо сервисов. Долговечность 99,999999999 %; Object Lock для бэкапов. Проектное решение |
-| OpenSearch | `PIN_TEXT_INDEX`: 30 ТБ, 600 первичных шардов по 50 ГБ (п. 6.2) | Полнотекстовый поиск по 300 млрд пинов (24 700 / 74 100 запросов/с, п. 5.6). Инвертированный индекс + ранжирование. Альтернатива - PostgreSQL full-text - хуже масштабируется. Проектное решение |
+| OpenSearch | `PIN_TEXT_INDEX`: 30 ТБ, 600 шардов по 50 ГБ, полная копия в каждом регионе, 52 узла (п. 6.2, 11.4) | Полнотекстовый поиск по 300 млрд пинов (24 700 / 74 100 запросов/с, п. 5.6). Инвертированный индекс + ранжирование. Альтернатива - PostgreSQL full-text - хуже масштабируется. Проектное решение |
 | FAISS (IVF-PQ) [[30]](https://github.com/facebookresearch/faiss), [[39]](https://arxiv.org/abs/1702.08734) | `PIN_VECTOR`: 30 шардов по 240 ГБ (п. 6.2, 7.2) | 7,2 ТБ вместо 81,6 ТБ без сжатия (в 11,3 раза); при 18 500 QPS визуального поиска нужен ANN. Точный перебор невозможен (25 мин на запрос, п. 7.2.3). Проектное решение на основе опубликованного метода |
 | **Потоки данных** | | |
-| Apache Kafka [[24]](https://kafka.apache.org/documentation/) | `EVENT_STREAM`: события приложения, `cdc.mysql`, `cdc.tidb`; RF 3, хранение 3 суток (п. 6.2) | Одно событие читают несколько групп: счётчики, интересы, индексатор, инвалидатор кеша, Graph-сервис. Kafka - журнал с перечитыванием после сбоя; RabbitMQ удаляет сообщение после получения. Проектное решение |
-| Debezium [[25]](https://debezium.io/documentation/) и TiCDC | CDC: binlog MySQL и TiDB → Kafka (п. 6.1) | Захват изменений из журнала БД решает проблему «двойной записи»: счётчики, индексы, инвалидация кеша и рёбра графа узнают обо всех изменениях. Проектное решение |
+| Apache Kafka [[24]](https://kafka.apache.org/documentation/) | `EVENT_STREAM`: события приложения, `cdc.mysql.*`, `cdc.tidb`; RF 3, хранение 3 суток (п. 6.2) | Одно событие читают несколько групп: счётчики, интересы, индексатор, инвалидатор кеша, Graph-сервис. Kafka - журнал с перечитыванием после сбоя; RabbitMQ удаляет сообщение после получения. Проектное решение |
+| Debezium [[25]](https://debezium.io/documentation/) и TiCDC | CDC: binlog пяти кластеров MySQL (топики `cdc.mysql.*`) и TiDB → Kafka (п. 6.1) | Захват изменений из журнала БД решает проблему «двойной записи»: счётчики, индексы, инвалидация кеша и рёбра графа узнают обо всех изменениях. Проектное решение |
 | **Резервное копирование** | | |
 | Percona XtraBackup [[28]](https://docs.percona.com/percona-xtrabackup/) | Полный физический снимок MySQL (п. 6.8) | Горячий бэкап без остановки БД; с binlog даёт PITR и RPO 5 мин. Проектное решение |
 | TiDB BR [[26]](https://docs.pingcap.com/tidb/stable/backup-and-restore-overview) | Снимок TiDB + журнал (п. 6.8) | RPO 5 мин; 3 реплики Raft переживают отказ зоны без бэкапа. Проектное решение |
@@ -1722,7 +1772,8 @@ Facebook с leases снизил пик запросов к БД с 17 тыс. д
 | **Подходы** | | |
 | 64-битный идентификатор с номером шарда [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) | `USER`, `BOARD`, `PIN`, `MEDIA` (п. 5.1, 6.3) | Глобальный автоинкремент - точка синхронизации и отказа; UUID длиннее и не содержит маршрута. Наш id выдаётся локально, иммутабелен, содержит `shard_id`. Экономия 42 ТБ только на `PIN_LIKE`. У Pinterest так [[10]](https://medium.com/pinterest-engineering/sharding-pinterest-how-we-scaled-our-mysql-fleet-3f341e96ca6f) |
 | Случайные блуждания Pixie [[36]](https://arxiv.org/abs/1711.07601) | Лента рекомендаций (п. 7.1) | Время обхода не зависит от размера графа; 26,7 мс CPU на обход (п. 7.1.8). Альтернатива - пакетный расчёт - в 4 раза больше вычислений и устаревает до суток. Проверено в продакшене Pinterest [[36]](https://arxiv.org/abs/1711.07601) |
-| Cache-aside с замком и L1 [[40]](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala) | Чтение метаданных (п. 7.3) | Замок `add` даёт одного читателя БД на ключ (250 чтений → 1, п. 7.3.8); L1 снимает горячие ключи до 141 чтения в секунду. Альтернатива - без замка - лавина; write-through засоряет кеш. Приём Facebook [[40]](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala), адаптирован под стандартный Memcached |
+| Cache-aside с замком и L1 [[40]](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala) | Чтение метаданных (п. 7.3) | Замок `add` даёт одного читателя БД на ключ (250 чтений → 1, п. 7.3.8); L1 снимает горячие ключи до 85 чтений в секунду. Альтернатива - без замка - лавина; write-through засоряет кеш. Приём Facebook [[40]](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala), адаптирован под стандартный Memcached |
+| Saga (хореография) и outbox через чтение журнала [[43]](https://microservices.io/patterns/data/transactional-outbox.html), [[44]](https://microservices.io/patterns/data/saga.html) | Создание и сохранение пина между кластерами `media`, `pin`, `board` (п. 5.3, 9.2) | Общей транзакции между кластерами нет; шаги идемпотентны, событие даёт журнал MySQL, дополнительных таблиц и записей нет. Двухфазный коммит блокирует кластеры и плохо масштабируется. Проектное решение |
 | IVF-PQ [[39]](https://arxiv.org/abs/1702.08734) | Визуальный поиск (п. 7.2) | 7,2 ТБ вместо 81,6 ТБ; 2,29 млн кодов вместо 300 млрд. Точный перебор невозможен. HNSW - в 22 раза больше памяти. Опубликованный метод [[39]](https://arxiv.org/abs/1702.08734) |
 | **Наблюдаемость** | | |
 | Prometheus-совместимые метрики + Alertmanager | Ключевые показатели (п. 4-7) | Тревоги: доля попаданий Memcached ниже 90 % (п. 7.3.9), отставание репликации MySQL больше 1 с (п. 6.7), отставание потребителей Kafka (п. 6.2), возраст снимка графа (п. 7.1.9), recall ANN ниже 0,8 (п. 7.2.8). Проектное решение |
@@ -1732,6 +1783,59 @@ Facebook с leases снизил пик запросов к БД с 17 тыс. д
 
 
 ---
+
+
+## 9. Обеспечение надёжности
+
+### 9.1 Резервирование компонентов
+
+
+| Компонент | Вид резервирования | Схема | При отказе |
+| --- | --- | --- | --- |
+| Регион (ДЦ) | Резервирование ёмкости | 3 региона, перелив по порогу 80 %, возврат 70 % | Global Accelerator меняет веса, соседние регионы принимают промахи CDN. Данные региона восстанавливаются из бэкапов с кросс-региональной копией S3 (RPO 5 мин, RTO часы) |
+| Route 53 + Global Accelerator | Резервирование физических компонентов | managed, health-check, anycast | Недоступный регион исключается из ответа DNS |
+| CDN | N+1 | 4 провайдера | Трафик провайдера делят остальные |
+| L4 (NLB) | N*2 | 2 узла на регион, ECMP, оба активны | Остаётся узел второй зоны |
+| L7 (NGINX Ingress) | 2×(⌈N/2⌉+1) | 6 / 8 / 16 узлов  | Узел исключается health-check, зона - переливом |
+| Сервисы (поды) | 2×(⌈N/2⌉+1) на уровне узлов, Envoy outlier detection | 40 kube-узлов, 2 зоны, anti-affinity  | Kubernetes перезапускает под, Envoy выводит нездоровый под из балансировки |
+| EKS control plane | Managed | 3 зоны | Работает без участия команды |
+| ProxySQL | N*2 | пара на кластер БД в регионе | Второй узел принимает все соединения |
+| MySQL (5 кластеров) | Резервирование БД | primary + sync + async, разные зоны; Orchestrator [[27]](https://github.com/openark/orchestrator) | Реплика с минимальным отставанием становится primary за 1 мин, RPO 0; отказ кластера затрагивает только свой домен |
+| ZooKeeper | N+1 по кворуму | 3 узла на регион | Кворум 2 из 3, карты шардов читаются |
+| TiDB | Резервирование БД | 3 реплики Raft в 3 зонах, PD * 3 | Raft выбирает нового лидера, потеря зоны не нужна бэкапу |
+| Redis | Резервирование БД | 1 мастер + 1 реплика в другой зоне | Реплика заменяет мастера. Потеря `SESSION` - повторный вход, `USER_RECENT` - лента по интересам |
+| Memcached | Без реплик | 25 узлов на регион, mcrouter failover | Потеря узла: промахи 5 % → 8,8 %, замок и L1 защищают БД |
+| Kafka | Резервирование БД | RF 3, min.insync.replicas 2, 3 зоны, sink в S3 | Лидер партиции переизбирается, потерь нет |
+| Kafka Connect (Debezium, TiCDC) | Резервирование ресурсов | 3 воркера на регион, offset в Kafka | Задача переезжает на другой воркер, дубли гасит идемпотентный потребитель |
+| OpenSearch | Резервирование ресурсов | полная копия индекса в каждом регионе | Запросы региона уходят в соседний, шарды восстанавливаются копированием |
+| ANN | Резервирование БД | 2 копии каждого шарда в регионе | Ответ из 29 шардов (-3 % кандидатов), копия подхватывает запросы |
+| Graph-сервис | 2×(⌈N/2⌉+1) | 18 узлов, снимок в S3 | Узел исключается, при потере всех - лента по `USER_INTEREST` |
+| Сервис эмбеддингов (GPU) | N+1 | 2 / 3 / 5 серверов | Задачи ждут в Kafka, индексация новых пинов задерживается |
+| Воркеры перекодирования | Резервирование ресурсов | Workers Pool из Kafka | Задача без подтверждения возвращается в очередь |
+| S3 | Резервирование физических компонентов | 3 зоны, версионирование, CRR | Переключение на копию в другом регионе |
+| Мониторинг | Резервирование физических компонентов | 3 узла на регион (Prometheus HA, Alertmanager) | Живые узлы продолжают сбор и тревоги |
+
+### 9.2 Асинхронные паттерны взаимодействия сервисов
+
+| Паттерн | Участники (сервисы) | Обоснование |
+| --- | --- | --- |
+| Transactional outbox (чтение журнала) [[43]](https://microservices.io/patterns/data/transactional-outbox.html) | Pin Service, Board Service, Media Service → Debezium → Kafka | Вставка `PIN` в `mysql-pin` сама является событием (`cdc.mysql.pin`): отдельной таблицы нет, дополнительных записей нет. Событие не теряется, если сервис упал после коммита |
+| Saga, хореография [[44]](https://microservices.io/patterns/data/saga.html) | Media Service → Pin Service → Board Service | Создание и сохранение пина затрагивает три кластера MySQL без общей транзакции: `MEDIA` → `PIN` + `PIN_STATS` → `BOARD_PIN`. Компенсация: если доска удалена, `PIN.status` = удалён |
+| Idempotent Consumer | Применение `BOARD_PIN`, счётчики, `USER_INTEREST`, `USER_RECENT`, инвалидация кеша | Kafka доставляет at-least-once. `BOARD_PIN` пишется с детерминированным ключом (`sequence` = `created_at` пина), повтор не создаёт дубль |
+| CQRS | Interaction Service (запись) и чтение счётчиков из Redis/`PIN_STATS` | Запись лайка - событие в Kafka и `PIN_LIKE`; счётчики считает потребитель пакетами, чтение их не блокирует |
+| Workers Pool | Media Service, воркеры перекодирования, сервис эмбеддингов | Перекодирование видео (≈ 60 с CPU на файл) не должно занимать CPU сервисов; очередь Kafka сглаживает пик |
+| Dead Letter Queue | Потребители счётчиков, индексатора, `BOARD_PIN`, инвалидации | Сообщение, не обработанное с 5 попыток, уходит в `*.dlq`, очередь не блокируется |
+
+### 9.3 Защита синхронных вызовов
+
+| Механизм | Где | Параметры |
+| --- | --- | --- |
+| Таймауты и повторы с лимитом | Envoy между сервисами | 3 повтора не более 20 % запросов, чтобы повторы не создавали лавину |
+| Circuit breaker на кластер БД | Envoy, ProxySQL | Недоступность `mysql-board` не блокирует показ пинов: метаданные идут из кеша (п. 7.3) |
+| Деградация | Feed, Search | Нет Graph-сервиса - лента по интересам; нет ANN - только текстовый поиск |
+
+---
+
 
 ## Список источников
 
@@ -1814,3 +1918,13 @@ Facebook с leases снизил пик запросов к БД с 17 тыс. д
 [[39]](https://arxiv.org/abs/1702.08734) Johnson, Douze, Jégou. *FAISS*, 2017
 
 [[40]](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala) Nishtala et al. *Scaling Memcache*, NSDI 2013
+
+[[41]](https://www.techempower.com/benchmarks/#section=data-r22&test=fortune) TechEmpower Framework Benchmarks, Round 22
+
+[[42]](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/) Kubernetes: Resource Management for Pods and Containers
+
+[[43]](https://microservices.io/patterns/data/transactional-outbox.html) Transactional outbox pattern
+
+[[44]](https://microservices.io/patterns/data/saga.html) Saga pattern
+
+[[45]](https://aws.amazon.com/ec2/instance-types/) Amazon EC2 instance types
